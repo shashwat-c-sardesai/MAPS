@@ -1042,6 +1042,7 @@ class multicomp_bayesian():
 
         """
         General case multi-component analysis
+        (only works with linear spherical harmonic basis)
 
         rhok: Per frequency cross correlation
         sigk: Per frequency uncertainties
