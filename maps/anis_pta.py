@@ -1034,6 +1034,161 @@ class anis_pta():
         return 1 / (2 * 6.283185346689728)
 
 
+
+class multicomp_bayesian():
+
+    def __init__(self, pta_anis, rhok, sigk, nfreq, Tspan,
+                 gamma_iso=None, noise_marginalization=False):
+
+        """
+        General case multi-component analysis
+
+        rhok: Per frequency cross correlation
+        sigk: Per frequency uncertainties
+        nfreq: Number of frequency components
+        Tspan: Observing time span
+        gamma_iso: Isotropic process spectral amplitude,
+                   If None, searches for gamma_iso
+        noisem_marginalization: In the name
+        """
+
+        pta_anis.rhok = rhok
+        pta_anis.sigk = sigk
+        pta_anis.n_freq = nfreq
+        pta_anis.Tspan = Tspan
+        
+        self.pta_anis = pta_anis
+        self.gamma_iso = gamma_iso
+        self.nm = noise_marginalization
+
+        self.priors = self._priors()
+        self.param_names =  [p.name for p in self.priors]
+        self.ndim = len(self.param_names)
+
+    def _priors(self):
+
+        log10_A_0 = parameter.Uniform(pmin=-18, pmax=-11)("log10_A_0")
+        log10_A_1 = parameter.Uniform(pmin=-18, pmax=-11)("log10_A_1")
+
+        clm_priors = []
+        for f in range(pta_anis.n_freq):
+            for l in range(1, pta_anis.l_max+1):
+                for m in range(-l, l+1):
+                    clm_priors.append(parameter.Uniform(pmin=-1, pmax=1)(f"c_{l}{m}_{f}"))
+
+        if self.gamma_iso is None:
+            gamma_0 = parameter.Uniform(pmin=0, pmax=3)("gamma_0")
+            return [log10_A_0, gamma_0, log10_A_1, *clm_priors]
+        else:
+            reutrn [log10_A_0, log10_A_1, *clm_priors]
+
+    def LogPrior(self, params):
+        return np.sum([p.get_logpdf(pp) for p,pp in zip(self.priors, params)])
+
+    def LogLikelihood(self, params):
+
+        clm_00 = np.sqrt(4*np.pi)
+        clm_size = (self.pta_anis.l_max+1)**2 - 1
+
+        A2_iso = (10 ** params[0])**2
+        if self.gamma_iso is None:
+            gamma_iso = params[1]
+            A2_ani = (10 ** params[2])**2
+            clm_anis = params[3:]
+            S_iso = (np.arange(1,self.pta_anis.n_freq+1)/self.pta_anis.Tspan*yr)**(-1*gamma_iso)
+        else:
+            A2_ani = (10 ** params[1])**2
+            clm_anis = params[2:]
+            S_iso = (np.arange(1,self.pta_anis.n_freq+1)/self.pta_anis.Tspan*yr)**(-1*self.gamma_iso)
+
+        S_ani = (np.arange(1,self.pta_anis.n_freq+1)/self.pta_anis.Tspan*yr)**(-1*self.pta_anis.gamma_ani)
+        
+        clms_ani = np.zeros(((1+self.pta_anis.l_max)**2,self.pta_anis.n_freq))
+        clms_ani[0,:] = clm_00
+        for ff in range(self.pta_anis.n_freq):
+            clms_ani[1:,ff] = clm_anis[ff*clm_size:(ff+1)*clm_size]
+        clms_ani[:,:] *= A2_ani * S_ani[None,:]
+
+        clms_iso = np.zeros(((1+self.pta_anis.l_max)**2,self.pta_anis.n_freq))
+        clms_iso[0,:] = clm_00
+        clms_iso[:,:] *= A2_iso * S_iso[None,:]
+
+        sim_orf = self.pta_anis.Gamma_lm.T @ (clms_iso + clms_ani)
+
+        if self.nm == False:
+            residual = sim_orf - self.pta_anis.rhok
+            denom = np.log(2*np.pi*self.pta_anis.sigk**2)
+    
+            loglike = -.5*np.sum(residual**2/self.pta_anis.sigk**2 + denom)
+
+        else:
+            residual = sim_orf[None,:,:] - self.pta_anis.rhok
+            denom = np.log(2*np.pi*self.pta_anis.sigk**2)
+    
+            lik = -.5*np.sum(residual**2/self.pta_anis.sigk**2 + denom, axis=(1,2))
+            loglike = np.sum(lik) - self.pta_anis.n_draws
+
+        return loglike
+
+    def setup_sampler(self, outdir='./ptmcmc', resume=True):
+
+        os.makedirs(outdir, exist_ok=True)
+        cov = np.diag(np.ones(self.ndim) * 0.1**2)
+        groups = [[n] for n in range(self.ndim)]
+        if self.gamma_iso is None:
+            groups.extend([[0,1,2]])
+            groups.extend([[0,1]])
+            groups.extend([[n] for n in range(2,self.ndim)])
+            groups.extend([[n for n in range(3+ff*clm_size, 3+(ff+1)*clm_size)] for ff in range(self.pta_anis.n_freq)])
+            groups.extend([[2, *np.arange(3, self.ndim)]])
+        else:
+            groups.extend([[0,1]])
+            groups.extend([[n] for n in range(1,self.ndim)])
+            groups.extend([[n for n in range(2+ff*clm_size, 2+(ff+1)*clm_size)] for ff in range(self.pta_anis.n_freq)])
+            groups.extend([[1, *np.arange(2, self.ndim)]])
+        sampler = ptmcmc(self.ndim, self.LogLikelihood, self.LogPrior, cov, outDir=outdir, resume=resume, groups=groups)
+
+        sampler.addProposalToCycle(self.draw_from_prior, 80)
+        if self.gamma_iso is None:
+            sampler.addProposalToCycle(self.draw_from_iso, 50)
+        sampler.addProposalToCycle(self.draw_from_total_prior, 70)
+
+        return sampler
+
+    def draw_from_prior(self, params, iter, beta):
+
+        q = params.copy()
+        lqxy = 0 # Assuming uniform priors
+
+        # randomly choose parameter
+        param = np.random.choice(self.priors)
+
+        # if vector parameter jump in random component
+        q[list(self.param_names).index(param.name)] = param.sample()
+
+        return q, float(lqxy)
+
+    def draw_from_iso(self, params, iter, beta):
+
+        q = params.copy()
+        lqxy = 0 # Assuming uniform priors
+
+        for n,p in enumerate(self.priors[:2]):
+            q[n] = p.sample()
+
+        return q, float(lqxy)
+
+    def draw_from_total_prior(self, params, iter, beta):
+
+        q = params.copy()
+        lqxy = 0 # Assuming uniform priors
+
+        for n,p in enumerate(self.priors):
+            q[n] = p.sample()
+
+        return q, float(lqxy)
+
+
 class anis_hypermodel():
 
 
