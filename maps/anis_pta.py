@@ -1057,6 +1057,7 @@ class multicomp_bayesian():
         pta_anis.sigk = sigk
         pta_anis.n_freq = nfreq
         pta_anis.Tspan = Tspan
+        pta_anis.gamma_ani = 13/3
         
         self.pta_anis = pta_anis
         self.gamma_iso = gamma_iso
